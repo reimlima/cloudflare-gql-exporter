@@ -9,7 +9,7 @@
 This is an exporter that exposes information gathered from Cloudflare for use by the Prometheus monitoring system using the new GraphQL API
 
 ## Badges
-[![python][python-badge]][pyversion-url] ![pylint-score]
+[![python][python-badge]][python-version] ![pylint-score]
 
 ## Considerations about Cloudflare Metrics
 
@@ -99,7 +99,7 @@ Add the job in Prometheus with:
 
 ## Grafana Dashboard
 
-<img src="dashboard/dashboard-demo.png" alt="Dashboard Demo" width="500"/>
+<img src="dashboard/dashboard-demo.png" alt="Dashboard Demo" width="800"/>
 
 Import [the dashboard file](./dashboard/cloudflare_gql_exporter.json) to your Grafana to start visualize your metrics.
 
