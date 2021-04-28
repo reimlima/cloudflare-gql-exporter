@@ -1,0 +1,4 @@
+gql==2.0.0
+systemd==0.16.1
+prometheus-client==0.10.1
+PyYAML==5.3.1

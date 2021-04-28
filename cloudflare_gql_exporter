@@ -1,0 +1,766 @@
+#!/usr/bin/env python3
+# -*- python -*-
+# -*- coding: utf-8 -*-
+
+'''
+Exposes to Prometheus collected metrics from Cloudflare GraphQL
+'''
+
+import os
+import re
+import sys
+import time
+import logging
+import argparse
+import datetime
+import socket
+from wsgiref.simple_server import make_server
+import yaml
+from prometheus_client import make_wsgi_app
+from prometheus_client.core import GaugeMetricFamily, REGISTRY
+from gql import gql, Client
+from gql.transport.requests import RequestsHTTPTransport
+from systemd.journal import JournaldLogHandler
+
+# Loggin to Journalctl
+SCRIPT_NAME = os.path.basename(sys.argv[0])
+LOGGER = logging.getLogger(SCRIPT_NAME)
+JOURNALD_HANDLER = JournaldLogHandler()
+JOURNALD_HANDLER.setFormatter(logging.Formatter('[%(levelname)s] %(message)s'))
+LOGGER.addHandler(JOURNALD_HANDLER)
+LOGGER.setLevel(logging.INFO)
+
+# Dealing with command line options
+parser = argparse.ArgumentParser()
+parser.add_argument('-p', '--port',
+        help='Exporter port, default: 9042',
+        nargs='?',
+        const=9042,
+        type=int,
+        default=9042)
+parser.add_argument('-l', '--loglevel',
+        help='Log verbosity, default: info',
+        nargs='?',
+        const='info',
+        default='info')
+parser.add_argument('-c','--config',
+        help='Path to config file')
+args = parser.parse_args()
+
+if len(sys.argv)==1:
+    parser.print_help()
+    sys.exit(1)
+
+app_port = args.port
+app_config = args.config
+
+# Reading the App Config File
+try:
+    CONFIG = yaml.full_load(open(app_config))
+    cf_api_url = CONFIG['CF-API-URL']
+    cf_account_tag = CONFIG['CF-ACCOUNT-TAG']
+    cf_auth_email = CONFIG['X-AUTH-EMAIL']
+    cf_auth_key = CONFIG['X-AUTH-KEY']
+    main_colo = CONFIG['MAIN-COLO']
+except IOError:
+    LOGGER.error('ERROR: Could not open configuration file: %s', CONFIG)
+    sys.exit(1)
+except yaml.scanner.ScannerError:
+    LOGGER.error('ERROR: Cound not read configuration file: %s', CONFIG)
+    sys.exit(1)
+except yaml.parser.ParserError:
+    LOGGER.error('ERROR: Invalid configuration file format: %s', CONFIG)
+    sys.exit(1)
+
+def dict_transformation(income_dict):
+    '''
+    Convert python dict into part of GraphQL query, then return
+    '''
+    try:
+        query = str(income_dict.values())
+        query = re.sub(r'^dict_values\(','', query) # Converting
+        query = re.sub("[][,']",'', query)          # Python Dict
+        query = re.sub(':','{', query)              # into a
+        query = re.sub(r'\{([a-z])',r'\1', query)   # GraphQL query
+        query = re.sub(r'([{}])',r' \1 ', query)    # the ugliest way
+        query = re.sub('  ',' ', query)             # you ever seen in
+        query = re.sub(r'[ ]?\)$','', query)        # your entire life!
+    except re.error as exit_error:
+        LOGGER.error("unable to format string: %s", exit_error)
+        sys.exit(1)
+
+    return query
+
+def graph_ql_zone_query(account_hash, hexa, search):
+    '''
+    Build full zone search query
+    '''
+    zone_query = '''query {{
+        viewer {{
+            accounts(
+                filter: {{
+                    accountTag: "{f_hash}"
+                }}
+            )
+            {{
+                zones(
+                    limit: 10,
+                    filter:{{
+                        zoneTag_gt: "{hexa_filter}"
+                    }}
+                )
+                {{
+                    {zone_search}
+                }}
+            }}
+        }}
+    }}'''.format(f_hash=account_hash,
+            hexa_filter=hexa,
+            zone_search=search)
+    return zone_query
+
+def graph_ql_generic_query(hash_tag, zone_data_set, request_search):
+    '''
+    Buld full http request query
+    '''
+    # Converting time to UTC, used as pattern in datetime Cloudflare GraphQL
+    utc_now = datetime.datetime.utcnow()
+    utc_now = utc_now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    utc_while_ago = datetime.datetime.utcnow() - datetime.timedelta(seconds=120)
+    utc_while_ago = utc_while_ago.strftime("%Y-%m-%dT%H:%M:00Z")
+    request_query = '''query {{
+            viewer {{
+                zones(
+                    filter: {{
+                        zoneTag: "{filter_hash}"
+                    }}
+                )
+                {{
+                    {data_set}(
+                        orderBy: [datetimeMinute_ASC],
+                        limit: 1,
+                        filter: {{
+                            datetime_gt: "{datetime_gt}",
+                            datetime_lt: "{datetime_lt}"
+                        }}
+                    )
+                    {{
+                        dimensions {{
+                            datetimeMinute
+                        }}
+                        {search}
+                    }}
+                }}
+            }}
+        }}'''.format(filter_hash=hash_tag,
+                data_set=zone_data_set,
+                datetime_gt=utc_while_ago,
+                datetime_lt=utc_now,
+                search=request_search)
+    return request_query
+
+def graph_ql_colo_query(zone_data_set, zone_hash_tag, request_colo, search_colo):
+    '''
+    Buld full colocation request query
+    '''
+    utc_hour = datetime.datetime.utcnow()
+    utc_hour = utc_hour.strftime("%Y-%m-%dT%H:00:00Z")
+    colo_query = '''query {{
+            viewer {{
+                zones(
+                    filter: {{
+                        zoneTag:"{filter_hash}"
+                    }}
+                )
+                {{
+                    {data_set}(
+                        filter: {{
+                            datetime_gt: "{hour}",
+                            coloCode:"{colo}"
+                        }},
+                        limit:10000,
+                        orderBy: [datetimeHour_ASC]
+                    )
+                    {{
+                        {search}
+                    }}
+                }}
+            }}
+        }}'''.format(filter_hash=zone_hash_tag,
+                data_set=zone_data_set,
+                hour=utc_hour,
+                colo=request_colo,
+                search=search_colo)
+    return colo_query
+
+def graph_ql_query_generator(cf_hash_tag, qtype, **kwargs):
+    '''
+    Build the Graph_qL query based on Query Type
+    '''
+    request_colo = kwargs.get('colo')
+    try:
+        q_type_file = 'assets/{}.yml'.format(qtype)
+        cf_data_set = yaml.full_load(open(q_type_file))
+    except IOError:
+        LOGGER.error('ERROR: Could not open assets file: %s', qtype)
+        sys.exit(1)
+    except yaml.scanner.ScannerError:
+        LOGGER.error('ERROR: Cound not read assets file: %s', qtype)
+        sys.exit(1)
+    except yaml.parser.ParserError:
+        LOGGER.error('ERROR: Invalid assets file format: %s', qtype)
+        sys.exit(1)
+
+    q_dict_key = (" ".join(str(key) for key in cf_data_set.keys()))
+    search_criteria = dict_transformation(cf_data_set)
+
+    # Building the Graph_qL Query:
+    if q_dict_key == "zones":
+        hexa_list = ['0','1','2','3',
+                '4','5', '6','7',
+                '8', '9','a','b',
+                'c','d','e','f']
+        for hexa in hexa_list:
+            graph_ql_query = graph_ql_zone_query(cf_hash_tag,
+                    hexa,
+                    search_criteria)
+            yield graph_ql_query
+            graph_ql_query = ''
+    elif q_dict_key == "httpRequestsAdaptiveGroups":
+        graph_ql_query = graph_ql_colo_query(q_dict_key,
+                cf_hash_tag,
+                request_colo,
+                search_criteria)
+        yield graph_ql_query
+        graph_ql_query = ''
+    else:
+        graph_ql_query = graph_ql_generic_query(cf_hash_tag,
+                q_dict_key,
+                search_criteria)
+        yield graph_ql_query
+        graph_ql_query = ''
+
+def graph_ql_query_executor(api, email, key, cftype, **kwargs):
+    '''
+    Run the Query and Receive the result
+    '''
+    cf_ac_tag = kwargs.get('cf_ac_tag')
+    cf_zone_tag = kwargs.get('cf_zone_tag')
+    colo = kwargs.get('colo')
+    if cf_ac_tag:
+        tag = cf_ac_tag
+        query = graph_ql_query_generator(tag, cftype)
+    if cf_zone_tag:
+        tag = cf_zone_tag
+        query = graph_ql_query_generator(tag, cftype, colo=colo)
+        LOGGER.info("querying for metrics in: %s", tag)
+    for j in query:
+        qexec = gql(j)
+        sample_transport=RequestsHTTPTransport(
+            url=api,
+            use_json=True,
+            retries=1,
+            headers={
+                "X-AUTH-EMAIL": email,
+                "X-AUTH-KEY": key,
+            },
+        )
+
+        client = Client(
+            transport=sample_transport,
+            fetch_schema_from_transport=False,
+        )
+
+        try:
+            graph_ql_query_data = client.execute(qexec)
+            yield graph_ql_query_data
+        except Exception:
+            LOGGER.warning("Unable to collect data from: %s", tag)
+
+def firewall_metrics_builder(metric_tag, fw_dict):
+    '''
+    Convert Received dict into firewall metrics
+    '''
+    default_value_fw = 0
+    firewall_metric_dict = {}
+    firewall_metric_dict['count'] = {}
+    firewall_metric_dict['count'][0] = {}
+    try:
+        default_value_fw = fw_dict['viewer']['zones'][0]['firewallEventsAdaptiveGroups'][0]['count']
+    except IndexError:
+        LOGGER.warning("no firewall event metrics for: %s", metric_tag)
+    firewall_metric_dict['count'][0][0] = {'metric_name': 'cf_firewall_event'}
+    firewall_metric_dict['count'][0][1] = {'metric_help': 'Number of Firewall Events'}
+    firewall_metric_dict['count'][0][2] = {'label_name': 'type'}
+    firewall_metric_dict['count'][0][3] = {'label_value': 'count'}
+    firewall_metric_dict['count'][0][4] = {'value': default_value_fw}
+    yield firewall_metric_dict
+
+def http_colo_metrics_builder(metric_tag, colo_dict):
+    '''
+    Convert Received dict into http request metrics
+    '''
+    default_value_colo_count = 0
+    default_value_colo_bytes = 0
+    default_value_colo_visits = 0
+    colo_metric_dict = {}
+    colo_metric_dict['count'] = {}
+    colo_metric_dict['bytes'] = {}
+    colo_metric_dict['visit'] = {}
+    colo_metric_dict['count'][0] = {}
+    colo_metric_dict['bytes'][0] = {}
+    colo_metric_dict['visit'][0] = {}
+
+    try:
+        colo_metrics_dict = colo_dict['viewer']['zones'][0]['httpRequestsAdaptiveGroups'][0]
+        default_value_colo_count = colo_metrics_dict['count']
+        default_value_colo_bytes = colo_metrics_dict['sum']['edgeResponseBytes']
+        default_value_colo_visits = colo_metrics_dict['sum']['visits']
+    except IndexError:
+        LOGGER.warning("no colocation metrics for: %s", metric_tag)
+    colo_metric_dict['count'][0][0] = {'metric_name': 'cf_colo_requests'}
+    colo_metric_dict['count'][0][1] = {'metric_help': 'Request count in Main Colocation'}
+    colo_metric_dict['count'][0][2] = {'label_name': 'type'}
+    colo_metric_dict['count'][0][3] = {'label_value': 'count'}
+    colo_metric_dict['count'][0][4] = {'value': default_value_colo_count}
+    colo_metric_dict['bytes'][0][0] = {'metric_name': 'cf_colo_requests'}
+    colo_metric_dict['bytes'][0][1] = {'metric_help': 'Edge Response Bytes in Main Colocation'}
+    colo_metric_dict['bytes'][0][2] = {'label_name': 'type'}
+    colo_metric_dict['bytes'][0][3] = {'label_value': 'bytes'}
+    colo_metric_dict['bytes'][0][4] = {'value': default_value_colo_bytes}
+    colo_metric_dict['visit'][0][0] = {'metric_name': 'cf_colo_requests'}
+    colo_metric_dict['visit'][0][1] = {'metric_help': 'Edge Requests in Main Colocation'}
+    colo_metric_dict['visit'][0][2] = {'label_name': 'type'}
+    colo_metric_dict['visit'][0][3] = {'label_value': 'visit'}
+    colo_metric_dict['visit'][0][4] = {'value': default_value_colo_visits}
+    yield colo_metric_dict
+
+def http_request_metrics_builder(metric_tag, http_dict):
+    '''
+    Convert Received dict into colocation metrics
+    '''
+    default_value_bytes = 0
+    default_value_requests = 0
+    default_value_pageviews = 0
+    default_value_basic_requests = 0
+    default_value_threads = 0
+    default_value_uniq_visitors = 0
+    default_value_encripted_bytes = 0
+    default_value_encripted_requests = 0
+    http_metric_dict = {}
+    http_metric_dict['http_code'] = {}
+    http_metric_dict['c_request_req'] = {}
+    http_metric_dict['c_request_bytes'] = {}
+    http_metric_dict['c_type_req'] = {}
+    http_metric_dict['c_type_bytes'] = {}
+    http_metric_dict['http_code'] = {}
+    http_metric_dict['pageviews'] = {}
+    http_metric_dict['requests'] = {}
+    http_metric_dict['threats'] = {}
+    http_metric_dict['uniq'] = {}
+    http_metric_dict['bytes'] = {}
+    http_metric_dict['encripted'] = {}
+    http_metric_dict['http_code'][0] = {}
+    http_metric_dict['c_request_req'][0] = {}
+    http_metric_dict['c_request_bytes'][0] = {}
+    http_metric_dict['c_type_req'][0] = {}
+    http_metric_dict['c_type_bytes'][0] = {}
+    http_metric_dict['http_code'][0] = {}
+    http_metric_dict['pageviews'][0] = {}
+    http_metric_dict['requests'][0] = {}
+    http_metric_dict['threats'][0] = {}
+    http_metric_dict['uniq'][0] = {}
+    http_metric_dict['bytes'][0] = {}
+    http_metric_dict['encripted'][0] = {}
+    http_code_list = [
+            101, 200, 201, 204,
+            206, 301, 302, 304,
+            400, 401, 403, 404,
+            405, 408, 409, 410,
+            412, 416, 429, 499,
+            500, 501, 502, 503,
+            504, 520, 521, 522,
+            523, 524, 525, 530
+            ]
+    content_type_list = [
+            'js', 'webp', 'css', 'html',
+            'json', 'empty', 'jpeg', 'svg',
+            'png', 'unknown', 'rss', 'ico',
+            'bin', 'gif', 'txt', 'xml',
+            'eot', 'atom', 'mp4', 'pdf',
+            'bmp', 'mpga'
+            ]
+    country_map_list = [
+            'US', 'BR', 'CA', 'FR', 'GB', 'DE', 'SG', 'NO', 'CY', 'BE',
+            'IE', 'RU', 'JP', 'IL', 'CN', 'NL', 'PT', 'CZ', 'FI', 'AU',
+            'ES', 'GR', 'IT', 'DK', 'PE', 'CO', 'KR', 'PL', 'UA', 'SE',
+            'MZ', 'AO', 'SK', 'AT', 'HR', 'CH', 'MX', 'AG', 'HK', 'CL',
+            'PY', 'AR', 'ZA', 'TW', 'IN', 'UY', 'BO', 'VN', 'VE', 'ID',
+            'NZ', 'BG', 'CV', 'DO', 'LU', 'GW', 'LV', 'TR', 'ST', 'LT',
+            'TH', 'NG', 'RS', 'HU', 'NI', 'SA', 'MK', 'BZ', 'PA', 'MO',
+            'AE', 'KZ', 'RO', 'MQ', 'SN', 'AM', 'CU', 'EC', 'EG', 'MM',
+            'GA', 'PH', 'EE', 'BD', 'TL', 'BJ', 'ZM', 'TN', 'MF', 'MY',
+            'BA', 'TZ', 'SI', 'BY', 'LB', 'GH', 'AL'
+            ]
+    try:
+        http_metrics_dict = http_dict['viewer']['zones'][0]['httpRequests1mGroups'][0]
+        default_value_pageviews = http_metrics_dict['sum']['pageViews']
+        default_value_basic_requests = http_metrics_dict['sum']['requests']
+        default_value_threads = http_metrics_dict['sum']['threats']
+        default_value_uniq_visitors = http_metrics_dict['uniq']['uniques']
+        default_value_encripted_bytes = http_metrics_dict['sum']['encryptedBytes']
+        default_value_encripted_requests = http_metrics_dict['sum']['encryptedRequests']
+        count = 0
+        http_metric_dict['pageviews'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['pageviews'][0][1] = {'metric_help': 'Http Request Page Views'}
+        http_metric_dict['pageviews'][0][2] = {'label_name': 'type'}
+        http_metric_dict['pageviews'][0][3] = {'label_value': 'pageviews'}
+        http_metric_dict['pageviews'][0][4] = {'value': default_value_pageviews}
+        http_metric_dict['requests'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['requests'][0][1] = {'metric_help': 'Http Basic Requests'}
+        http_metric_dict['requests'][0][2] = {'label_name': 'type'}
+        http_metric_dict['requests'][0][3] = {'label_value': 'requests'}
+        http_metric_dict['requests'][0][4] = {'value': default_value_basic_requests}
+        http_metric_dict['threats'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['threats'][0][1] = {'metric_help': 'Http Request Threads'}
+        http_metric_dict['threats'][0][2] = {'label_name': 'type'}
+        http_metric_dict['threats'][0][3] = {'label_value': 'threats'}
+        http_metric_dict['threats'][0][4] = {'value': default_value_threads}
+        http_metric_dict['uniq'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['uniq'][0][1] = {'metric_help': 'Http Request Unique Visitors'}
+        http_metric_dict['uniq'][0][2] = {'label_name': 'type'}
+        http_metric_dict['uniq'][0][3] = {'label_value': 'uniq'}
+        http_metric_dict['uniq'][0][4] = {'value': default_value_uniq_visitors}
+        http_metric_dict['bytes'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['bytes'][0][1] = {'metric_help': 'Http Request Encripted Bytes'}
+        http_metric_dict['bytes'][0][2] = {'label_name': 'type'}
+        http_metric_dict['bytes'][0][3] = {'label_value': 'bytes'}
+        http_metric_dict['bytes'][0][4] = {'value': default_value_encripted_bytes}
+        http_metric_dict['encripted'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['encripted'][0][1] = {'metric_help': 'Http Request Encripted Bytes'}
+        http_metric_dict['encripted'][0][2] = {'label_name': 'type'}
+        http_metric_dict['encripted'][0][3] = {'label_value': 'requests'}
+        http_metric_dict['encripted'][0][4] = {'value': default_value_encripted_requests}
+        for code in http_code_list:
+            for response_status_map in http_metrics_dict['sum']['responseStatusMap']:
+                if response_status_map['edgeResponseStatus'] == code:
+                    default_value_requests = response_status_map['requests']
+                else:
+                    pass
+            http_metric_dict['http_code'][count] = {}
+            http_metric_dict['http_code'][count][0] = {
+                    'metric_name': 'cf_http_requests_status_code'
+                    }
+            http_metric_dict['http_code'][count][1] = {
+                    'metric_help': 'Http Request HTTP Status Code'
+                    }
+            http_metric_dict['http_code'][count][2] = {
+                    'label_name': 'code'
+                    }
+            http_metric_dict['http_code'][count][3] = {
+                    'label_value': code
+                    }
+            http_metric_dict['http_code'][count][4] = {
+                    'value': default_value_requests
+                    }
+            default_value_requests = 0
+            count += 1
+
+        count = 0
+
+        for types in content_type_list:
+            for content_type_map in http_metrics_dict['sum']['contentTypeMap']:
+                if content_type_map['edgeResponseContentTypeName'] == types:
+                    default_value_requests = content_type_map['requests']
+                    default_value_bytes = content_type_map['bytes']
+                else:
+                    pass
+            http_metric_dict['c_type_req'][count] = {}
+            http_metric_dict['c_type_bytes'][count] = {}
+            http_metric_dict['c_type_req'][count][0] = {
+                    'metric_name': 'cf_http_requests_content_type_request'
+                    }
+            http_metric_dict['c_type_req'][count][1] = {
+                    'metric_help': 'Http Request Content Type Requests'
+                    }
+            http_metric_dict['c_type_req'][count][2] = {
+                    'label_name': 'type'
+                    }
+            http_metric_dict['c_type_req'][count][3] = {
+                    'label_value': types
+                    }
+            http_metric_dict['c_type_req'][count][4] = {
+                    'value': default_value_requests
+                    }
+            http_metric_dict['c_type_bytes'][count][0] = {
+                    'metric_name': 'cf_http_requests_content_type_bytes'
+                    }
+            http_metric_dict['c_type_bytes'][count][1] = {
+                    'metric_help': 'Http Request Content Type Bytes'
+                    }
+            http_metric_dict['c_type_bytes'][count][2] = {
+                    'label_name': 'type'
+                    }
+            http_metric_dict['c_type_bytes'][count][3] = {
+                    'label_value': types
+                    }
+            http_metric_dict['c_type_bytes'][count][4] = {
+                    'value': default_value_bytes
+                    }
+            count += 1
+            default_value_bytes = 0
+            default_value_requests = 0
+
+        count = 0
+
+        for l_country in country_map_list:
+            for country_map in http_metrics_dict['sum']['countryMap']:
+                if country_map['clientCountryName'] == l_country:
+                    default_value_requests = country_map['requests']
+                    default_value_bytes = country_map['bytes']
+                else:
+                    pass
+            http_metric_dict['c_request_req'][count] = {}
+            http_metric_dict['c_request_bytes'][count] = {}
+            http_metric_dict['c_request_req'][count][0] = {
+                    'metric_name': 'cf_http_requests_country_requests'
+                    }
+            http_metric_dict['c_request_req'][count][1] = {
+                    'metric_help': 'Http Request Content Type Requests'
+                    }
+            http_metric_dict['c_request_req'][count][2] = {
+                    'label_name': 'country'
+                    }
+            http_metric_dict['c_request_req'][count][3] = {
+                    'label_value': l_country
+                    }
+            http_metric_dict['c_request_req'][count][4] = {
+                    'value': default_value_requests
+                    }
+            http_metric_dict['c_request_bytes'][count][0] = {
+                    'metric_name': 'cf_http_requests_country_bytes'
+                    }
+            http_metric_dict['c_request_bytes'][count][1] = {
+                    'metric_help': 'Http Request Content Type Bytes'
+                    }
+            http_metric_dict['c_request_bytes'][count][2] = {
+                    'label_name': 'country'
+                    }
+            http_metric_dict['c_request_bytes'][count][3] = {
+                    'label_value': l_country
+                    }
+            http_metric_dict['c_request_bytes'][count][4] = {
+                    'value': default_value_bytes
+                    }
+            count += 1
+            default_value_bytes = 0
+            default_value_requests = 0
+
+        count = 0
+    except IndexError:
+        LOGGER.warning("no http_request metrics for %s", metric_tag)
+        count = 0
+        http_metric_dict['pageviews'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['pageviews'][0][1] = {'metric_help': 'Http Request Page Views'}
+        http_metric_dict['pageviews'][0][2] = {'label_name': 'type'}
+        http_metric_dict['pageviews'][0][3] = {'label_value': 'pageviews'}
+        http_metric_dict['pageviews'][0][4] = {'value': default_value_pageviews}
+        http_metric_dict['requests'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['requests'][0][1] = {'metric_help': 'Http Basic Requests'}
+        http_metric_dict['requests'][0][2] = {'label_name': 'type'}
+        http_metric_dict['requests'][0][3] = {'label_value': 'requests'}
+        http_metric_dict['requests'][0][4] = {'value': default_value_basic_requests}
+        http_metric_dict['threats'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['threats'][0][1] = {'metric_help': 'Http Request Threads'}
+        http_metric_dict['threats'][0][2] = {'label_name': 'type'}
+        http_metric_dict['threats'][0][3] = {'label_value': 'threats'}
+        http_metric_dict['threats'][0][4] = {'value': default_value_threads}
+        http_metric_dict['uniq'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['uniq'][0][1] = {'metric_help': 'Http Request Unique Visitors'}
+        http_metric_dict['uniq'][0][2] = {'label_name': 'type'}
+        http_metric_dict['uniq'][0][3] = {'label_value': 'uniq'}
+        http_metric_dict['uniq'][0][4] = {'value': default_value_uniq_visitors}
+        http_metric_dict['bytes'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['bytes'][0][1] = {'metric_help': 'Http Request Encripted Bytes'}
+        http_metric_dict['bytes'][0][2] = {'label_name': 'type'}
+        http_metric_dict['bytes'][0][3] = {'label_value': 'bytes'}
+        http_metric_dict['bytes'][0][4] = {'value': default_value_encripted_bytes}
+        http_metric_dict['encripted'][0][0] = {'metric_name': 'cf_http_requests_basic'}
+        http_metric_dict['encripted'][0][1] = {'metric_help': 'Http Request Encripted Bytes'}
+        http_metric_dict['encripted'][0][2] = {'label_name': 'type'}
+        http_metric_dict['encripted'][0][3] = {'label_value': 'requests'}
+        http_metric_dict['encripted'][0][4] = {'value': default_value_encripted_requests}
+
+        for code in http_code_list:
+            http_metric_dict['http_code'][count] = {}
+            http_metric_dict['http_code'][count][0] = {
+                    'metric_name': 'cf_http_requests_status_code'
+                    }
+            http_metric_dict['http_code'][count][1] = {
+                    'metric_help': 'Http Request HTTP Status Code'
+                    }
+            http_metric_dict['http_code'][count][2] = {
+                    'label_name': 'code'
+                    }
+            http_metric_dict['http_code'][count][3] = {
+                    'label_value': code
+                    }
+            http_metric_dict['http_code'][count][4] = {
+                    'value': default_value_requests
+                    }
+            count += 1
+        count = 0
+
+        for types in content_type_list:
+            http_metric_dict['c_type_req'][count] = {}
+            http_metric_dict['c_type_bytes'][count] = {}
+            http_metric_dict['c_type_req'][count][0] = {
+                    'metric_name': 'cf_http_requests_content_type_request'
+                    }
+            http_metric_dict['c_type_req'][count][1] = {
+                    'metric_help': 'Http Request Content Type Requests'
+                    }
+            http_metric_dict['c_type_req'][count][2] = {
+                    'label_name': 'type'
+                    }
+            http_metric_dict['c_type_req'][count][3] = {
+                    'label_value': types
+                    }
+            http_metric_dict['c_type_req'][count][4] = {
+                    'value': default_value_requests
+                    }
+            http_metric_dict['c_type_bytes'][count][0] = {
+                    'metric_name': 'cf_http_requests_content_type_bytes'
+                    }
+            http_metric_dict['c_type_bytes'][count][1] = {
+                    'metric_help': 'Http Request Content Type Bytes'
+                    }
+            http_metric_dict['c_type_bytes'][count][2] = {
+                    'label_name': 'type'
+                    }
+            http_metric_dict['c_type_bytes'][count][3] = {
+                    'label_value': types
+                    }
+            http_metric_dict['c_type_bytes'][count][4] = {
+                    'value': default_value_bytes
+                    }
+            count += 1
+        count = 0
+
+        for l_country in country_map_list:
+            http_metric_dict['c_request_req'][count] = {}
+            http_metric_dict['c_request_bytes'][count] = {}
+            http_metric_dict['c_request_req'][count][0] = {
+                    'metric_name': 'cf_http_requests_country_requests'
+                    }
+            http_metric_dict['c_request_req'][count][1] = {
+                    'metric_help': 'Http Request Content Type Requests'
+                    }
+            http_metric_dict['c_request_req'][count][2] = {
+                    'label_name': 'country'
+                    }
+            http_metric_dict['c_request_req'][count][3] = {
+                    'label_value': l_country
+                    }
+            http_metric_dict['c_request_req'][count][4] = {
+                    'value': default_value_requests
+                    }
+            http_metric_dict['c_request_bytes'][count][0] = {
+                    'metric_name': 'cf_http_requests_country_bytes'
+                    }
+            http_metric_dict['c_request_bytes'][count][1] = {
+                    'metric_help': 'Http Request Content Type Bytes'
+                    }
+            http_metric_dict['c_request_bytes'][count][2] = {
+                    'label_name': 'country'
+                    }
+            http_metric_dict['c_request_bytes'][count][3] = {
+                    'label_value': l_country
+                    }
+            http_metric_dict['c_request_bytes'][count][4] = {
+                    'value': default_value_bytes
+                    }
+            count += 1
+        count = 0
+
+    yield http_metric_dict
+
+class ClouflareCollector(object):
+    '''
+    Bla
+    '''
+    def collect(self):
+        '''
+        Main function that coordinates exporter collection flow
+        '''
+        zone_tag_list = []
+        metric_data = {}
+        flow_begin = int(time.strftime('%s'))
+        data_set_files = os.listdir(path='assets/')
+        # Find the Zone Tag List. The max results limitated by the GraphQL query is 160
+        LOGGER.info("starting to look for DNS zones")
+        zone_dict = graph_ql_query_executor(cf_api_url,
+            cf_auth_email,
+            cf_auth_key,
+            'zones',
+            cf_ac_tag=cf_account_tag)
+        for zones in zone_dict:
+            for zonetag in zones['viewer']['accounts'][0]['zones']:
+                zone_tag_list.append(zonetag['zoneTag'])
+        zone_tag_list = sorted(set(zone_tag_list))
+        for tag in zone_tag_list:
+            for files in data_set_files:
+                files = re.sub('.yml','', files)
+                if files == 'zones':
+                    continue
+                data_set_dict = graph_ql_query_executor(
+                        cf_api_url,
+                        cf_auth_email,
+                        cf_auth_key,
+                        files,
+                        cf_zone_tag=tag,
+                        colo=main_colo)
+                for data_set in data_set_dict:
+                    main_dict_key = ''.join(str(key) for key in data_set['viewer']['zones'][0].keys())
+                    if main_dict_key == 'httpRequests1mGroups':
+                        metric_data = http_request_metrics_builder(tag, data_set)
+                    elif main_dict_key == 'httpRequestsAdaptiveGroups':
+                        metric_data = http_colo_metrics_builder(tag, data_set)
+                    else:
+                        metric_data = firewall_metrics_builder(tag, data_set)
+
+                    for dict_key in metric_data:
+                        for metric_key in dict_key.keys():
+                            for result_count in dict_key[metric_key].keys():
+                                metric = GaugeMetricFamily(
+                                    dict_key[metric_key][result_count][0]['metric_name'],
+                                    dict_key[metric_key][result_count][1]['metric_help'],
+                                    labels=[
+                                        dict_key[metric_key][result_count][2]['label_name'],
+                                        'zone_tag'
+                                    ]
+                                )
+                                metric.add_metric(
+                                    [
+                                        str(dict_key[metric_key][result_count][3]['label_value']),
+                                        tag
+                                    ],
+                                    dict_key[metric_key][result_count][4]['value']
+                                )
+                                yield metric
+        flow_end = int(time.strftime('%s'))
+        total_flow_time = flow_end - flow_begin
+        LOGGER.info("total execution time: %d", total_flow_time)
+
+if __name__ == "__main__":
+    LOGGER.info("starting app %s", SCRIPT_NAME)
+    # Test if the port_number is in use by another process
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    result = sock.connect_ex(('0.0.0.0', app_port))
+    if result == 0:
+        LOGGER.error('port %s already in use by another app', (str(app_port)))
+        sys.exit(1)
+    REGISTRY.register(ClouflareCollector())
+    app = make_wsgi_app(REGISTRY)
+    httpd = make_server('', app_port, app)
+    httpd.serve_forever()

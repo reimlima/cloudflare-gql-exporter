@@ -1,0 +1,11 @@
+---
+httpRequestsAdaptiveGroups:
+  - count
+  -
+    sum:
+      - edgeResponseBytes
+      - visits
+  -
+    dimensions:
+      - datetimeHour
+      - coloCode

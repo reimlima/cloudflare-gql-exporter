@@ -1,0 +1,11 @@
+[Unit]
+Description=Cloudflare GraphQL Exporter
+Wants=network.target network-online.target
+After=network.target network-online.target
+
+[Service]
+WorkingDirectory=/path/to/application/cloudflare-gql-exporter
+Restart=always
+ExecStart=/path/to/application/cloudflare_gql_exporter --port 9042 --loglevel info --config /path/to/cloudflare-gql-exporter.yml
+[Install]
+WantedBy=default.target
